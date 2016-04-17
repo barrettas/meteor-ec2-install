@@ -1,29 +1,5 @@
 #!/bin/bash
 
-# HOW TO EXECUTE:
-#	1.	SSH into a fresh installation of Ubuntu 12.10 64-bit
-#	2.	Put this script anywhere, such as /tmp/install.sh
-#	3.	$ chmod +x /tmp/install.sh && /tmp/install.sh
-#
-
-# NOTES:
-#	1.	IMPORTANT: You must create a .#production file in the root of your Meteor
-#		app. An example .#production file looks like this:
-#
-# 		export MONGO_URL='mongodb://user:pass@linus.mongohq.com:10090/dbname'
-# 		export ROOT_URL='http://www.mymeteorapp.com'
-# 		export NODE_ENV='production'
-# 		export PORT=80
-#
-#	2.	The APPHOST variable below should be updated to the hostname or elastic
-#		IP of the EC2 instance you created.
-#
-#	3.	The SERVICENAME variable below can remain the same, but if you prefer
-#		you can name it after your app (example: SERVICENAME=foobar).
-#
-#	4.	Logs for you app can be found under /var/log/[SERVICENAME].log
-#
-
 ################################################################################
 # Variables you should adjust for your setup
 ################################################################################
@@ -40,8 +16,11 @@ MAINGROUP=$(id -g -n $MAINUSER)
 
 GITBAREREPO=/home/$MAINUSER/$SERVICENAME.git
 EXPORTFOLDER=/tmp/$SERVICENAME
+
 APPFOLDER=/home/$MAINUSER/$SERVICENAME
-APPEXECUTABLE=/home/$MAINUSER/.$SERVICENAME
+APPBINFOLDER=$APPFOLDER/bin
+APPENV=$APPFOLDER/env.sh
+APPCONFIGBASE=$APPFOLDER/config
 
 ################################################################################
 # Utility functions
@@ -105,6 +84,11 @@ function configure_automatic_security_updates {
 	echo "--------------------------------------------------------------------------------"
 
 	# Reference: http://plusbryan.com/my-first-5-minutes-on-a-server-or-essential-security-for-linux-servers
+
+	# Note that you will still need to do your own restarts. Uncomment this line if you
+	# would like to have your server restarted automatically at 11:59pm on Sundays:
+	#append "/etc/crontab" "59 23\t* * 7\troot\t/sbin/shutdown -r now >> /dev/null 2>&1"
+
 	sudo apt-get -y install unattended-upgrades
 
 	replace "/etc/apt/apt.conf.d/10periodic" \
@@ -152,6 +136,14 @@ function install_meteor {
 	curl https://install.meteor.com | /bin/sh
 }
 
+function install_meteorite {
+	echo "--------------------------------------------------------------------------------"
+	echo "Install Meteorite"
+	echo "--------------------------------------------------------------------------------"
+
+	sudo -H npm install meteorite -g
+}
+
 function install_phantomjs {
 	echo "--------------------------------------------------------------------------------"
 	echo "Install PhantomJS"
@@ -167,8 +159,8 @@ function setup_app_skeleton {
 	echo "--------------------------------------------------------------------------------"
 
 	rm -rf $APPFOLDER
-	mkdir -p $APPFOLDER
-	touch $APPFOLDER/main.js
+	mkdir -p $APPBINFOLDER
+	touch $APPBINFOLDER/main.js
 }
 
 function setup_app_service {
@@ -200,7 +192,7 @@ function setup_app_service {
 	append $SERVICEFILE "script"
 	append $SERVICEFILE "  sleep 5"
 	append $SERVICEFILE "  echo \$\$ > /var/run/$SERVICENAME.pid"
-	append $SERVICEFILE "  $APPEXECUTABLE \"$LOGFILE\""
+	append $SERVICEFILE "  exec bash -c 'cd $APPFOLDER && source $APPENV && exec /usr/bin/node $APPBINFOLDER/main.js >> \"$LOGFILE\" 2>&1'"
 	append $SERVICEFILE "end script"
 }
 
@@ -235,47 +227,58 @@ function setup_post_update_hook {
 	append $HOOK "echo \"------------------------------------------------------------------------\""
 	append $HOOK "sudo rm -rf $EXPORTFOLDER"
 	append $HOOK "mkdir -p $EXPORTFOLDER"
-	append $HOOK "git archive master | tar -x -C $EXPORTFOLDER"
+	append $HOOK "while read oldrev newrev refname"
+	append $HOOK "do"
+	append $HOOK "  BRANCH=\$(git rev-parse --symbolic --abbrev-ref \$refname)"
+	append $HOOK "  git clone --recursive \"\$PWD\" -b \$BRANCH $EXPORTFOLDER"
+	append $HOOK "  rm -rf $EXPORTFOLDER/.git*"
+	append $HOOK "done"
 
 	append $HOOK "echo \"------------------------------------------------------------------------\""
-	append $HOOK "echo \"Updating production executable\""
+	append $HOOK "echo \"Updating environment variable files\""
 	append $HOOK "echo \"------------------------------------------------------------------------\""
-	append $HOOK "sudo mv -f $EXPORTFOLDER/.#production $APPEXECUTABLE"
-	append $HOOK "echo -e \"\\\n\\\n/usr/bin/node $APPFOLDER/main.js >> \\\$1 2>&1\" >> $APPEXECUTABLE"
-	append $HOOK "chmod 700 $APPEXECUTABLE"
+	append $HOOK "mkdir -p $APPCONFIGBASE/\$BRANCH"
+	append $HOOK "cp -f $EXPORTFOLDER/config/\$BRANCH/env.sh $APPENV"
+	append $HOOK "cp -f $EXPORTFOLDER/config/\$BRANCH/settings.json $APPCONFIGBASE/\$BRANCH/settings.json"
 
 	append $HOOK "echo \"------------------------------------------------------------------------\""
 	append $HOOK "echo \"Bundling app as a standalone Node.js app\""
 	append $HOOK "echo \"------------------------------------------------------------------------\""
+	append $HOOK "mkdir -p $RSYNCSOURCE"
 	append $HOOK "cd $EXPORTFOLDER"
-	append $HOOK "meteor update"
-	append $HOOK "sudo meteor bundle $EXPORTFOLDER/bundle.tar.gz"
-	append $HOOK "if [ -f $EXPORTFOLDER/bundle.tar.gz ]; then"
-	append $HOOK "  mkdir -p $RSYNCSOURCE"
-	append $HOOK "  tar -zxf $EXPORTFOLDER/bundle.tar.gz --strip-components 1 -C $RSYNCSOURCE"
+	append $HOOK "if [ -f $EXPORTFOLDER/smart.json ]; then"
+	append $HOOK "  mrt build --directory $RSYNCSOURCE"
+	append $HOOK "else"
+	append $HOOK "  meteor build --directory $RSYNCSOURCE"
+	append $HOOK "fi"
+	append $HOOK "if [ -f $RSYNCSOURCE/bundle/main.js ]; then"
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  echo \"Adjust bundle permissions\""
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  sudo find \"$RSYNCSOURCE/bundle\" -type f -exec chmod 644 {} +;"
+	append $HOOK "  sudo find \"$RSYNCSOURCE/bundle\" -type d -exec chmod 755 {} +;"
 
-	append $HOOK "  if [ -f $RSYNCSOURCE/main.js ]; then"
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    echo \"Building Fibers\""
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    cd $RSYNCSOURCE/server/node_modules"
-	append $HOOK "    rm -rf fibers"
-	append $HOOK "    sudo npm install fibers@1.0.0"
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  echo \"Run npm install\""
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  (cd $RSYNCSOURCE/bundle/programs/server && npm install)"
 
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    echo \"Rsync standalone app to active app location\""
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    rsync --checksum --recursive --update --delete --times $RSYNCSOURCE/ $APPFOLDER/"
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  echo \"Rsync standalone app to active app location\""
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  rsync --checksum --recursive --update --delete --times $RSYNCSOURCE/bundle/ $APPBINFOLDER/"
 
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    echo \"Restart app\""
-	append $HOOK "    echo \"------------------------------------------------------------------------\""
-	append $HOOK "    sudo service $SERVICENAME restart"
-	append $HOOK "  fi"
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  echo \"Restart app\""
+	append $HOOK "  echo \"------------------------------------------------------------------------\""
+	append $HOOK "  sudo service $SERVICENAME restart"
 
 	# Clean-up
-	append $HOOK "  cd $APPFOLDER"
+	append $HOOK "  cd $APPBINFOLDER"
 	append $HOOK "  sudo rm -rf $EXPORTFOLDER"
+
+	append $HOOK "else"
+	append $HOOK "  echo \"Oops... couldn't find main.js\""
 	append $HOOK "fi"
 
 	append $HOOK "echo \"\n\n--- Done.\""
@@ -294,7 +297,7 @@ function show_conclusion {
 	echo "$ git remote add ec2 $MAINUSER@$APPHOST:$SERVICENAME.git"
 	echo ""
 	echo "Add to your ~/.ssh/config:"
-	echo -e "Host $APPHOST\n  Hostname $APPHOST\n  IdentityFile PRIVATE_KEY_YOU_GOT_FROM_AWS.pem"
+	echo -e "Host $APPHOST\n  IdentityFile PRIVATE_KEY_YOU_GOT_FROM_AWS.pem"
 	echo ""
 	echo "To deploy:"
 	echo "$ git push ec2 master"
@@ -321,6 +324,7 @@ install_git
 install_nodejs
 install_mongodb
 install_meteor
+install_meteorite
 install_phantomjs
 setup_app_skeleton
 setup_app_service
